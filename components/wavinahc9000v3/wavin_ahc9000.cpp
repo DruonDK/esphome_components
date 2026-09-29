@@ -134,11 +134,9 @@ void WavinAHC9000::update() {
     // Perform a compact refresh sequence for the channel
     if (this->read_registers(CAT_PACKED, ch_page, PACKED_CONFIGURATION, 1, regs) && regs.size() >= 1) {
       uint16_t raw_cfg = regs[0];
-      uint16_t mode_bits = raw_cfg & PACKED_CONFIGURATION_MODE_MASK;
-      bool is_off = (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY) || (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY_ALT);
-      st.mode = is_off ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
-      st.child_lock = (raw_cfg & PACKED_CONFIGURATION_CHILD_LOCK_MASK) != 0;
-      ESP_LOGD(TAG, "CH%u cfg=0x%04X mode=%s child_lock=%s", (unsigned) ch, (unsigned) raw_cfg, is_off ? "OFF" : "HEAT", st.child_lock?"Y":"N");
+      bool is_off = this->apply_packed_configuration_(st, raw_cfg);
+      ESP_LOGD(TAG, "CH%u cfg=0x%04X mode=%s int_lock=%s ctrl_lock=%s", (unsigned) ch, (unsigned) raw_cfg,
+               is_off ? "OFF" : "HEAT", st.int_lock ? "Y" : "N", st.ctrl_lock ? "Y" : "N");
       this->handle_standby_keepalive_(ch, is_off, keepalive_reassert);
       // Reconcile desired mode if pending and mismatch
       auto it_des = this->desired_mode_.find(ch);
@@ -146,9 +144,8 @@ void WavinAHC9000::update() {
         auto want = it_des->second;
         if (want != st.mode) {
           uint16_t current = raw_cfg;
-          // Enforce standard OFF bits or MANUAL
-          uint16_t new_bits = (want == climate::CLIMATE_MODE_OFF) ? PACKED_CONFIGURATION_MODE_STANDBY : PACKED_CONFIGURATION_MODE_MANUAL;
-          uint16_t next = (uint16_t) ((current & ~PACKED_CONFIGURATION_MODE_MASK) | (new_bits & PACKED_CONFIGURATION_MODE_MASK));
+          // Only MODE[2:0] and SCHED ENA change; locks and the other configuration bits are preserved
+          uint16_t next = this->compose_mode_config_(current, want);
           ESP_LOGW(TAG, "Reconciling mode for ch=%u cur=0x%04X next=0x%04X", (unsigned) ch, (unsigned) current, (unsigned) next);
           if (this->write_register(CAT_PACKED, ch_page, PACKED_CONFIGURATION, next)) {
             // Schedule another quick check
@@ -176,9 +173,9 @@ void WavinAHC9000::update() {
     if (!st.all_tp_lost && st.primary_index > 0) {
       uint8_t elem_page = (uint8_t) (st.primary_index - 1);
       if (this->read_registers(CAT_ELEMENTS, elem_page, 0x00, 11, regs) && regs.size() > ELEM_AIR_TEMPERATURE) {
-        st.current_temp_c = this->raw_to_c(regs[ELEM_AIR_TEMPERATURE]);
+        st.current_temp_c = this->raw_temp_to_c_(regs[ELEM_AIR_TEMPERATURE]);
         if (regs.size() > ELEM_FLOOR_TEMPERATURE) {
-          float ft = this->raw_to_c(regs[ELEM_FLOOR_TEMPERATURE]);
+          float ft = this->raw_temp_to_c_(regs[ELEM_FLOOR_TEMPERATURE]);
           // Basic plausibility filter (>1..90C) to avoid default/zero noise
           if (ft > 1.0f && ft < 90.0f) {
             st.floor_temp_c = ft;
@@ -225,11 +222,9 @@ void WavinAHC9000::update() {
         case 1: {
           if (this->read_registers(CAT_PACKED, ch_page, PACKED_CONFIGURATION, 1, regs) && regs.size() >= 1) {
             uint16_t raw_cfg = regs[0];
-            uint16_t mode_bits = raw_cfg & PACKED_CONFIGURATION_MODE_MASK;
-            bool is_off = (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY) || (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY_ALT);
-            st.mode = is_off ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
-            st.child_lock = (raw_cfg & PACKED_CONFIGURATION_CHILD_LOCK_MASK) != 0;
-            ESP_LOGD(TAG, "CH%u cfg=0x%04X mode=%s child_lock=%s", ch_num, (unsigned) raw_cfg, is_off ? "OFF" : "HEAT", st.child_lock?"Y":"N");
+            bool is_off = this->apply_packed_configuration_(st, raw_cfg);
+            ESP_LOGD(TAG, "CH%u cfg=0x%04X mode=%s int_lock=%s ctrl_lock=%s", ch_num, (unsigned) raw_cfg,
+                     is_off ? "OFF" : "HEAT", st.int_lock ? "Y" : "N", st.ctrl_lock ? "Y" : "N");
             this->handle_standby_keepalive_(ch_num, is_off, keepalive_reassert);
           } else {
             ESP_LOGW(TAG, "CH%u: mode read failed", ch_num);
@@ -267,9 +262,9 @@ void WavinAHC9000::update() {
           if (!st.all_tp_lost && st.primary_index > 0) {
             uint8_t elem_page = (uint8_t) (st.primary_index - 1);
             if (this->read_registers(CAT_ELEMENTS, elem_page, 0x00, 11, regs) && regs.size() > ELEM_AIR_TEMPERATURE) {
-              st.current_temp_c = this->raw_to_c(regs[ELEM_AIR_TEMPERATURE]);
+              st.current_temp_c = this->raw_temp_to_c_(regs[ELEM_AIR_TEMPERATURE]);
               if (regs.size() > ELEM_FLOOR_TEMPERATURE) {
-                float ft = this->raw_to_c(regs[ELEM_FLOOR_TEMPERATURE]);
+                float ft = this->raw_temp_to_c_(regs[ELEM_FLOOR_TEMPERATURE]);
                 if (ft > 1.0f && ft < 90.0f) {
                   st.floor_temp_c = ft;
                   st.has_floor_sensor = true;
@@ -380,9 +375,41 @@ void WavinAHC9000::add_active_channel(uint8_t ch) {
 
 // Repair functions removed; use normalize_channel_config via API service
 
+WavinAHC9000::RxResult WavinAHC9000::receive_frame_(uint8_t fc, std::vector<uint8_t> &buf, uint8_t &exception_code) {
+  // Normal response:    addr, fc,        byte count, data[byte count], crc lo, crc hi   => byte count + 5 bytes
+  // Exception response: addr, fc | 0x80, exception code, crc lo, crc hi                 => 5 bytes (spec chapter 4)
+  buf.clear();
+  exception_code = 0;
+  const uint8_t error_fc = (uint8_t) (fc | FC_EXCEPTION_FLAG);
+  uint32_t start = millis();
+  while (millis() - start < this->receive_timeout_ms_) {
+    while (this->available()) {
+      int c = this->read();
+      if (c < 0) break;
+      buf.push_back((uint8_t) c);
+      if (buf.size() >= 5 && buf[0] == DEVICE_ADDR) {
+        if (buf[1] == fc) {
+          size_t expected = (size_t) buf[2] + 5;
+          if (buf.size() == expected) {
+            return crc16(buf.data(), buf.size()) == 0 ? RxResult::OK : RxResult::CRC_ERROR;
+          }
+        } else if (buf[1] == error_fc) {
+          if (crc16(buf.data(), 5) != 0) return RxResult::CRC_ERROR;
+          exception_code = buf[2];
+          return RxResult::EXCEPTION;
+        }
+      }
+    }
+    // FIX: Tighter polling interval instead of delay(1) to avoid byte reception gaps
+    delayMicroseconds(100);
+  }
+  return RxResult::TIMEOUT;
+}
+
 bool WavinAHC9000::read_registers(uint8_t category, uint8_t page, uint8_t index, uint8_t count, std::vector<uint16_t> &out) {
   // Retry logic: attempt up to IO_RETRY_ATTEMPTS. First attempt failures are logged at DEBUG; only the
   // final failed attempt escalates to WARN to reduce log noise from transient bus glitches.
+  // An exception response from the controller is not retried: it is an answer, not a bus problem.
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
     // FIX: Inter-frame delay before each transaction to allow bus turnaround
     this->inter_frame_delay_();
@@ -405,51 +432,33 @@ bool WavinAHC9000::read_registers(uint8_t category, uint8_t page, uint8_t index,
     this->finish_tx_();
 
     std::vector<uint8_t> buf;
-    uint32_t start = millis();
-    while (millis() - start < this->receive_timeout_ms_) {
-      while (this->available()) {
-        int c = this->read();
-        if (c < 0) break;
-        buf.push_back((uint8_t) c);
-        if (buf.size() >= 5) {
-          uint8_t expected = (uint8_t) (buf[2] + 5);
-          if (buf[0] == DEVICE_ADDR && buf[1] == FC_READ && buf.size() == expected) {
-            uint16_t rcrc = crc16(buf.data(), buf.size());
-            if (rcrc != 0) {
-              // CRC mismatch: retry unless last attempt
-              if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-                ESP_LOGW(TAG, "RX: CRC mismatch (len=%u) after %u attempts", (unsigned) buf.size(), (unsigned) IO_RETRY_ATTEMPTS);
-              } else {
-                ESP_LOGD(TAG, "RX: CRC mismatch attempt %u (len=%u) -> retry", (unsigned) attempt + 1, (unsigned) buf.size());
-              }
-              goto next_attempt; // break both loops, retry
-            }
-            uint8_t bytes = buf[2];
-            out.clear();
-            for (uint8_t i = 0; i + 1 < bytes; i += 2) {
-              uint16_t w = (uint16_t) (buf[3 + i] << 8) | buf[3 + i + 1];
-              out.push_back(w);
-            }
-            return true;
-          }
-        }
+    uint8_t exc = 0;
+    RxResult r = this->receive_frame_(FC_READ, buf, exc);
+    if (r == RxResult::OK) {
+      uint8_t bytes = buf[2];
+      out.clear();
+      for (uint8_t i = 0; i + 1 < bytes; i += 2) {
+        uint16_t w = (uint16_t) (buf[3 + i] << 8) | buf[3 + i + 1];
+        out.push_back(w);
       }
-      // FIX: Tighter polling interval instead of delay(1) to avoid byte reception gaps
-      delayMicroseconds(100);
+      return true;
     }
-    // Timeout
+    if (r == RxResult::EXCEPTION) {
+      ESP_LOGW(TAG, "RX: controller rejected read, exception 0x%02X (cat=%u idx=%u page=%u cnt=%u)", exc, category, index, page, count);
+      return false;
+    }
+    const char *why = (r == RxResult::CRC_ERROR) ? "CRC mismatch" : "timeout";
     if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-      ESP_LOGW(TAG, "RX: timeout waiting for response after %u attempts (cat=%u idx=%u page=%u cnt=%u)", (unsigned) IO_RETRY_ATTEMPTS, category, index, page, count);
+      ESP_LOGW(TAG, "RX: %s after %u attempts (cat=%u idx=%u page=%u cnt=%u)", why, (unsigned) IO_RETRY_ATTEMPTS, category, index, page, count);
     } else {
-      ESP_LOGD(TAG, "RX: timeout attempt %u (cat=%u idx=%u page=%u) -> retry", (unsigned) attempt + 1, category, index, page);
+      ESP_LOGD(TAG, "RX: %s attempt %u (cat=%u idx=%u page=%u) -> retry", why, (unsigned) attempt + 1, category, index, page);
     }
-  next_attempt:;
   }
   return false;
 }
 
 bool WavinAHC9000::write_register(uint8_t category, uint8_t page, uint8_t index, uint16_t value) {
-  // Similar retry strategy as read_registers() with severity gating.
+  // Same retry strategy as read_registers(); exceptions are reported and not retried.
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
     this->inter_frame_delay_();
 
@@ -473,45 +482,33 @@ bool WavinAHC9000::write_register(uint8_t category, uint8_t page, uint8_t index,
     this->finish_tx_();
 
     std::vector<uint8_t> buf;
-    uint32_t start = millis();
-    while (millis() - start < this->receive_timeout_ms_) {
-      while (this->available()) {
-        int c = this->read();
-        if (c < 0) break;
-        buf.push_back((uint8_t) c);
-        if (buf.size() >= 5) {
-          uint8_t expected = (uint8_t) (buf[2] + 5);
-          if (buf[0] == DEVICE_ADDR && buf[1] == FC_WRITE && buf.size() == expected) {
-            uint16_t rcrc = crc16(buf.data(), buf.size());
-            bool ok = (rcrc == 0);
-            if (!ok) {
-              if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-                ESP_LOGW(TAG, "ACK-WR: CRC mismatch after %u attempts (cat=%u idx=%u page=%u)", (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
-              } else {
-                ESP_LOGD(TAG, "ACK-WR: CRC mismatch attempt %u -> retry", (unsigned) attempt + 1);
-              }
-              goto next_wr_attempt;
-            }
-            ESP_LOGD(TAG, "ACK-WR: OK");
-            return true;
-          }
-        }
-      }
-      // FIX: Tighter polling interval instead of delay(1) to avoid byte reception gaps
-      delayMicroseconds(100);
+    uint8_t exc = 0;
+    RxResult r = this->receive_frame_(FC_WRITE, buf, exc);
+    if (r == RxResult::OK) {
+      ESP_LOGD(TAG, "ACK-WR: OK");
+      return true;
     }
+    if (r == RxResult::EXCEPTION) {
+      ESP_LOGW(TAG, "ACK-WR: controller rejected write, exception 0x%02X (cat=%u idx=%u page=%u val=0x%04X)", exc, category, index, page, (unsigned) value);
+      return false;
+    }
+    const char *why = (r == RxResult::CRC_ERROR) ? "CRC mismatch" : "timeout";
     if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-      ESP_LOGW(TAG, "ACK-WR: timeout after %u attempts (cat=%u idx=%u page=%u)", (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
+      ESP_LOGW(TAG, "ACK-WR: %s after %u attempts (cat=%u idx=%u page=%u)", why, (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
     } else {
-      ESP_LOGD(TAG, "ACK-WR: timeout attempt %u (cat=%u idx=%u page=%u) -> retry", (unsigned) attempt + 1, category, index, page);
+      ESP_LOGD(TAG, "ACK-WR: %s attempt %u (cat=%u idx=%u page=%u) -> retry", why, (unsigned) attempt + 1, category, index, page);
     }
-  next_wr_attempt:;
   }
   return false;
 }
 
 bool WavinAHC9000::write_masked_register(uint8_t category, uint8_t page, uint8_t index, uint16_t and_mask, uint16_t or_mask) {
-  // Similar retry strategy as write_register(); reduces spurious WARN logs.
+  // Requested result: new = (current & and_mask) | or_mask.
+  // Wire format (spec 4.5): 2 bytes DATA followed by 2 bytes MASK, and the controller computes
+  //   new = (current & MASK) | (DATA & ~MASK)
+  // i.e. a 1 in MASK keeps the current bit. Translating gives MASK = and_mask & ~or_mask, DATA = or_mask.
+  const uint16_t keep_mask = (uint16_t) (and_mask & ~or_mask);
+  const uint16_t data = or_mask;
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
     this->inter_frame_delay_();
 
@@ -522,54 +519,37 @@ bool WavinAHC9000::write_masked_register(uint8_t category, uint8_t page, uint8_t
     msg[3] = index;
     msg[4] = page;
     msg[5] = 1;  // count
-    msg[6] = (uint8_t) (and_mask >> 8);
-    msg[7] = (uint8_t) (and_mask & 0xFF);
-    msg[8] = (uint8_t) (or_mask >> 8);
-    msg[9] = (uint8_t) (or_mask & 0xFF);
+    msg[6] = (uint8_t) (data >> 8);
+    msg[7] = (uint8_t) (data & 0xFF);
+    msg[8] = (uint8_t) (keep_mask >> 8);
+    msg[9] = (uint8_t) (keep_mask & 0xFF);
     uint16_t crc = crc16(msg, 10);
     msg[10] = (uint8_t) (crc & 0xFF);
     msg[11] = (uint8_t) (crc >> 8);
 
     this->prepare_for_tx_();
-    ESP_LOGD(TAG, "TX-WM: cat=%u idx=%u page=%u and=0x%04X or=0x%04X attempt=%u", category, index, page, (unsigned) and_mask, (unsigned) or_mask, (unsigned) attempt + 1);
+    ESP_LOGD(TAG, "TX-WM: cat=%u idx=%u page=%u data=0x%04X keep=0x%04X attempt=%u", category, index, page, (unsigned) data, (unsigned) keep_mask, (unsigned) attempt + 1);
     this->write_array(msg, 12);
     this->flush();
     this->finish_tx_();
 
     std::vector<uint8_t> buf;
-    uint32_t start = millis();
-    while (millis() - start < this->receive_timeout_ms_) {
-      while (this->available()) {
-        int c = this->read();
-        if (c < 0) break;
-        buf.push_back((uint8_t) c);
-        if (buf.size() >= 5) {
-          uint8_t expected = (uint8_t) (buf[2] + 5);
-          if (buf[0] == DEVICE_ADDR && buf[1] == FC_WRITE_MASKED && buf.size() == expected) {
-            uint16_t rcrc = crc16(buf.data(), buf.size());
-            bool ok = (rcrc == 0);
-            if (!ok) {
-              if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-                ESP_LOGW(TAG, "ACK-WM: CRC mismatch after %u attempts (cat=%u idx=%u page=%u)", (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
-              } else {
-                ESP_LOGD(TAG, "ACK-WM: CRC mismatch attempt %u -> retry", (unsigned) attempt + 1);
-              }
-              goto next_wm_attempt;
-            }
-            ESP_LOGD(TAG, "ACK-WM: OK");
-            return true;
-          }
-        }
-      }
-      // FIX: Tighter polling interval instead of delay(1) to avoid byte reception gaps
-      delayMicroseconds(100);
+    uint8_t exc = 0;
+    RxResult r = this->receive_frame_(FC_WRITE_MASKED, buf, exc);
+    if (r == RxResult::OK) {
+      ESP_LOGD(TAG, "ACK-WM: OK");
+      return true;
     }
+    if (r == RxResult::EXCEPTION) {
+      ESP_LOGW(TAG, "ACK-WM: controller rejected masked write, exception 0x%02X (cat=%u idx=%u page=%u)", exc, category, index, page);
+      return false;
+    }
+    const char *why = (r == RxResult::CRC_ERROR) ? "CRC mismatch" : "timeout";
     if (attempt + 1 == IO_RETRY_ATTEMPTS) {
-      ESP_LOGW(TAG, "ACK-WM: timeout after %u attempts (cat=%u idx=%u page=%u)", (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
+      ESP_LOGW(TAG, "ACK-WM: %s after %u attempts (cat=%u idx=%u page=%u)", why, (unsigned) IO_RETRY_ATTEMPTS, category, index, page);
     } else {
-      ESP_LOGD(TAG, "ACK-WM: timeout attempt %u (cat=%u idx=%u page=%u) -> retry", (unsigned) attempt + 1, category, index, page);
+      ESP_LOGD(TAG, "ACK-WM: %s attempt %u (cat=%u idx=%u page=%u) -> retry", why, (unsigned) attempt + 1, category, index, page);
     }
-  next_wm_attempt:;
   }
   return false;
 }
@@ -591,30 +571,46 @@ void WavinAHC9000::write_group_setpoint(const std::vector<uint8_t> &members, flo
   for (auto ch : members) this->write_channel_setpoint(ch, celsius);
 }
 
+uint16_t WavinAHC9000::compose_mode_config_(uint16_t current, climate::ClimateMode mode) const {
+  // Only MODE[2:0] and SCHED ENA are touched. INT LOCK, CTRL LOCK, ADAPT MODE, COOL MODE, HOTEL MODE
+  // and FLOOR ENA keep whatever the thermostats/user configured.
+  // SCHED ENA is cleared because MANUAL and PERMANENT STANDBY are defined with SCHED ENA = 0;
+  // SCHED ENA = 1 together with MODE = 1 is "TEMPORARY STANDBY (do not use)" in the specification (1.6.9).
+  uint16_t mode_bits = (mode == climate::CLIMATE_MODE_OFF) ? PACKED_CONFIGURATION_MODE_STANDBY : PACKED_CONFIGURATION_MODE_MANUAL;
+  return (uint16_t) ((current & ~(PACKED_CONFIGURATION_MODE_MASK | PACKED_CONFIGURATION_SCHED_ENA_MASK)) | mode_bits);
+}
+
+bool WavinAHC9000::apply_packed_configuration_(ChannelState &st, uint16_t raw_cfg) {
+  // Only PERMANENT STANDBY (MODE = 1) is reported as OFF. MODE = 4 is "PARTY ON MANUAL MODE" and
+  // must not be mistaken for standby; ECO/COMFORT/HOLIDAY/PARTY are all heating modes.
+  uint16_t mode_bits = raw_cfg & PACKED_CONFIGURATION_MODE_MASK;
+  bool is_off = (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY);
+  st.mode = is_off ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
+  st.int_lock = (raw_cfg & PACKED_CONFIGURATION_INT_LOCK_MASK) != 0;
+  st.ctrl_lock = (raw_cfg & PACKED_CONFIGURATION_CTRL_LOCK_MASK) != 0;
+  return is_off;
+}
+
 void WavinAHC9000::write_channel_mode(uint8_t channel, climate::ClimateMode mode) {
   if (channel < 1 || channel > 16) return;
   uint8_t page = (uint8_t) (channel - 1);
   this->desired_mode_[channel] = mode;
-  // Always use strict baseline to 0x4000/0x4001 for reliable OFF/HEAT
-  bool ok = false;
-  {
-    uint16_t strict_val = (uint16_t) (0x4000 | (mode == climate::CLIMATE_MODE_OFF ? PACKED_CONFIGURATION_MODE_STANDBY : PACKED_CONFIGURATION_MODE_MANUAL));
-    ok = this->write_register(CAT_PACKED, page, PACKED_CONFIGURATION, strict_val);
+  // Read-modify-write: the configuration register also holds the lock bits, adaptive mode, floor sensing
+  // and the week schedule flag. Writing a fixed baseline (the former 0x4000 | mode) wiped all of them on
+  // every mode change; normalize_channel_config() is the only place that still does that, on purpose.
+  std::vector<uint16_t> regs;
+  if (!this->read_registers(CAT_PACKED, page, PACKED_CONFIGURATION, 1, regs) || regs.size() < 1) {
+    ESP_LOGW(TAG, "Mode write: read PACKED_CONFIGURATION failed for ch=%u", (unsigned) channel);
+    return;
   }
-  if (!ok) {
-    // Fallback: read-modify-write full register (update only mode bits)
-    std::vector<uint16_t> regs;
-    if (this->read_registers(CAT_PACKED, page, PACKED_CONFIGURATION, 1, regs) && regs.size() >= 1) {
-      uint16_t current = regs[0];
-      // Prefer standard standby bits for OFF; otherwise use MANUAL
-      uint16_t new_bits = (mode == climate::CLIMATE_MODE_OFF) ? PACKED_CONFIGURATION_MODE_STANDBY : PACKED_CONFIGURATION_MODE_MANUAL;
-      uint16_t next = (uint16_t) ((current & ~PACKED_CONFIGURATION_MODE_MASK) | (new_bits & PACKED_CONFIGURATION_MODE_MASK));
-      ESP_LOGW(TAG, "WM fallback: PACKED_CONFIGURATION ch=%u cur=0x%04X next=0x%04X", (unsigned) channel, (unsigned) current, (unsigned) next);
-      ok = this->write_register(CAT_PACKED, page, PACKED_CONFIGURATION, next);
-  // No alternate OFF attempt to avoid special thermostat modes
-    } else {
-      ESP_LOGW(TAG, "WM fallback: read PACKED_CONFIGURATION failed for ch=%u", (unsigned) channel);
-    }
+  uint16_t current = regs[0];
+  uint16_t next = this->compose_mode_config_(current, mode);
+  bool ok = true;
+  if (next != current) {
+    ESP_LOGD(TAG, "Mode write: ch=%u cur=0x%04X next=0x%04X", (unsigned) channel, (unsigned) current, (unsigned) next);
+    ok = this->write_register(CAT_PACKED, page, PACKED_CONFIGURATION, next);
+  } else {
+    ESP_LOGD(TAG, "Mode write: ch=%u already 0x%04X, nothing to write", (unsigned) channel, (unsigned) current);
   }
   if (ok) {
     this->channels_[channel].mode = (mode == climate::CLIMATE_MODE_OFF) ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
@@ -630,31 +626,42 @@ void WavinAHC9000::write_channel_mode(uint8_t channel, climate::ClimateMode mode
   }
 }
 
-void WavinAHC9000::write_channel_child_lock(uint8_t channel, bool enable) {
+uint16_t WavinAHC9000::lock_mask_for_(LockKind kind) {
+  return kind == LockKind::LOCK_CTRL ? PACKED_CONFIGURATION_CTRL_LOCK_MASK : PACKED_CONFIGURATION_INT_LOCK_MASK;
+}
+
+static const char *lock_name(LockKind kind) { return kind == LockKind::LOCK_CTRL ? "Ctrl lock" : "Child lock"; }
+
+bool WavinAHC9000::is_channel_locked(uint8_t ch, LockKind kind) const {
+  auto it = this->channels_.find(ch);
+  if (it == this->channels_.end()) return false;
+  return kind == LockKind::LOCK_CTRL ? it->second.ctrl_lock : it->second.int_lock;
+}
+
+void WavinAHC9000::write_channel_lock(uint8_t channel, LockKind kind, bool enable) {
   if (channel < 1 || channel > 16) return;
   uint8_t page = (uint8_t) (channel - 1);
+  const uint16_t mask = lock_mask_for_(kind);
+  const char *name = lock_name(kind);
   std::vector<uint16_t> regs;
   if (!this->read_registers(CAT_PACKED, page, PACKED_CONFIGURATION, 1, regs) || regs.size() < 1) {
-    ESP_LOGW(TAG, "Child lock: read current config failed ch=%u", (unsigned) channel);
+    ESP_LOGW(TAG, "%s: read current config failed ch=%u", name, (unsigned) channel);
     return;
   }
   uint16_t current = regs[0];
-  uint16_t next;
-  if (enable)
-    next = (uint16_t) (current | PACKED_CONFIGURATION_CHILD_LOCK_MASK);
-  else
-    next = (uint16_t) (current & ~PACKED_CONFIGURATION_CHILD_LOCK_MASK);
+  uint16_t next = enable ? (uint16_t) (current | mask) : (uint16_t) (current & ~mask);
   if (next == current) {
-    ESP_LOGD(TAG, "Child lock: no change ch=%u (enable=%s)", (unsigned) channel, enable?"true":"false");
+    ESP_LOGD(TAG, "%s: no change ch=%u (enable=%s)", name, (unsigned) channel, enable ? "true" : "false");
     return;
   }
   if (this->write_register(CAT_PACKED, page, PACKED_CONFIGURATION, next)) {
-    this->channels_[channel].child_lock = enable;
+    auto &st = this->channels_[channel];
+    if (kind == LockKind::LOCK_CTRL) st.ctrl_lock = enable; else st.int_lock = enable;
     this->urgent_channels_.push_back(channel);
     this->suspend_polling_until_ = millis() + 100;
-    ESP_LOGI(TAG, "Child lock: set ch=%u -> %s (0x%04X)", (unsigned) channel, enable?"ENABLED":"DISABLED", (unsigned) next);
+    ESP_LOGI(TAG, "%s: set ch=%u -> %s (0x%04X)", name, (unsigned) channel, enable ? "ENABLED" : "DISABLED", (unsigned) next);
   } else {
-    ESP_LOGW(TAG, "Child lock: write failed ch=%u", (unsigned) channel);
+    ESP_LOGW(TAG, "%s: write failed ch=%u", name, (unsigned) channel);
   }
 }
 
@@ -787,10 +794,7 @@ void WavinAHC9000::generate_yaml_suggestion() {
         // Read basic mode + setpoint so climates look sensible in cache
         if (this->read_registers(CAT_PACKED, page, PACKED_CONFIGURATION, 1, regs) && regs.size() >= 1) {
           uint16_t raw_cfg = regs[0];
-          uint16_t mode_bits = raw_cfg & PACKED_CONFIGURATION_MODE_MASK;
-          bool is_off = (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY) || (mode_bits == PACKED_CONFIGURATION_MODE_STANDBY_ALT);
-          st.mode = is_off ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
-          st.child_lock = (raw_cfg & PACKED_CONFIGURATION_CHILD_LOCK_MASK) != 0;
+          this->apply_packed_configuration_(st, raw_cfg);
         }
         if (this->read_registers(CAT_PACKED, page, PACKED_MANUAL_TEMPERATURE, 1, regs) && regs.size() >= 1) {
           st.setpoint_c = this->raw_to_c(regs[0]);
@@ -803,9 +807,9 @@ void WavinAHC9000::generate_yaml_suggestion() {
         // Try to read elements block to surface air/floor temps and detect floor probe immediately
         uint8_t elem_page = (uint8_t) (primary_index - 1);
         if (this->read_registers(CAT_ELEMENTS, elem_page, 0x00, 11, regs) && regs.size() > ELEM_AIR_TEMPERATURE) {
-          st.current_temp_c = this->raw_to_c(regs[ELEM_AIR_TEMPERATURE]);
+          st.current_temp_c = this->raw_temp_to_c_(regs[ELEM_AIR_TEMPERATURE]);
           if (regs.size() > ELEM_FLOOR_TEMPERATURE) {
-            float ft = this->raw_to_c(regs[ELEM_FLOOR_TEMPERATURE]);
+            float ft = this->raw_temp_to_c_(regs[ELEM_FLOOR_TEMPERATURE]);
             if (ft > 1.0f && ft < 90.0f) {
               st.floor_temp_c = ft;
               bool threshold_hit = (ft >= 15.0f);
@@ -961,6 +965,7 @@ void WavinAHC9000::generate_yaml_suggestion() {
       switch_ss << "    wavinahc9000v3_id: wavin\n";
       switch_ss << "    name: \"" << fname << " Child Lock\"\n";
       switch_ss << "    channel: " << (int) ch << "\n";
+      switch_ss << "    type: child_lock\n";
     }
   }
   switch_ss << std::endl;
@@ -1054,14 +1059,12 @@ void WavinAHC9000::publish_updates() {
     }
   }
 
-  // Child lock switches
-  for (auto &kv : this->child_lock_switches_) {
-    uint8_t ch = kv.first;
-    auto *sw = kv.second;
+  // Lock switches (child lock = INT LOCK, ctrl lock = CTRL LOCK)
+  for (auto *sw : this->lock_switches_) {
     if (!sw) continue;
-    auto it = this->channels_.find(ch);
-    if (it != this->channels_.end()) {
-      sw->publish_state(it->second.child_lock);
+    uint8_t ch = sw->get_channel();
+    if (this->channels_.find(ch) != this->channels_.end()) {
+      sw->publish_state(this->is_channel_locked(ch, sw->get_lock_kind()));
     }
   }
 
@@ -1264,19 +1267,17 @@ void WavinZoneClimate::update_from_parent() {
       if (!std::isnan(fmax)) this->target_temperature_high = fmax;
     }
     this->mode = this->parent_->get_channel_mode(ch);
-    // Action: derive from temperatures with a small deadband, fallback to controller bit
-    const float db = 0.3f;  // hysteresis in °C
+    // Action comes from the controller's OUTP ON bit (actual actuator state), not from comparing
+    // temperatures. The controller may keep the output closed while the room is cold (global standby,
+    // floor max reached, high temperature cut-off) or open while it is warm (floor min, frost
+    // protection when a thermostat is lost). Deriving it from temperatures hid exactly those cases.
     auto raw_action = this->parent_->get_channel_action(ch);
-    if (!std::isnan(this->current_temperature) && !std::isnan(this->target_temperature)) {
-      if (this->current_temperature > this->target_temperature + db) {
-        this->action = climate::CLIMATE_ACTION_IDLE;
-      } else if (this->current_temperature < this->target_temperature - db) {
-        this->action = climate::CLIMATE_ACTION_HEATING;
-      } else {
-        this->action = raw_action;
-      }
+    if (raw_action == climate::CLIMATE_ACTION_HEATING) {
+      this->action = climate::CLIMATE_ACTION_HEATING;
+    } else if (this->mode == climate::CLIMATE_MODE_OFF) {
+      this->action = climate::CLIMATE_ACTION_OFF;
     } else {
-      this->action = raw_action;
+      this->action = climate::CLIMATE_ACTION_IDLE;
     }
   } else if (!this->members_.empty()) {
     float sum_curr = 0.0f;
@@ -1308,18 +1309,13 @@ void WavinZoneClimate::update_from_parent() {
     // Use primary member's setpoint directly (not an average)
     if (!std::isnan(primary_setpoint)) this->target_temperature = primary_setpoint;
     this->mode = all_off ? climate::CLIMATE_MODE_OFF : climate::CLIMATE_MODE_HEAT;
-    // Group action: prefer temperature comparison with deadband, fallback to any member heating
-    const float db = 0.3f;
-    if (!std::isnan(this->current_temperature) && !std::isnan(this->target_temperature)) {
-      if (this->current_temperature > this->target_temperature + db) {
-        this->action = climate::CLIMATE_ACTION_IDLE;
-      } else if (this->current_temperature < this->target_temperature - db) {
-        this->action = climate::CLIMATE_ACTION_HEATING;
-      } else {
-        this->action = any_heat ? climate::CLIMATE_ACTION_HEATING : climate::CLIMATE_ACTION_IDLE;
-      }
+    // Group action from the members' controller output bits (see the single-channel case above)
+    if (any_heat) {
+      this->action = climate::CLIMATE_ACTION_HEATING;
+    } else if (all_off) {
+      this->action = climate::CLIMATE_ACTION_OFF;
     } else {
-      this->action = any_heat ? climate::CLIMATE_ACTION_HEATING : climate::CLIMATE_ACTION_IDLE;
+      this->action = climate::CLIMATE_ACTION_IDLE;
     }
   }
   this->publish_state();

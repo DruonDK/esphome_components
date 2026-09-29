@@ -17,7 +17,7 @@ Integrates the Wavin AHC 9000 (a.k.a. Jablotron AC-116) floor heating controller
 | YAML suggestion (log output) | ✅ | Call `generate_yaml_suggestion()` to print entity templates |
 | Commented single climates for grouped members | ✅ | Keeps originals (commented) for reference |
 | Robust retry & polling pacing | ✅ | 2-attempt read/write retry logic |
-| Child lock (per channel) | ✅ | Exposed as switch; toggles controller LOCK bit |
+| Child lock / ctrl lock (per channel) | ✅ | `child_lock` = thermostat lock (bit 11); `ctrl_lock` = menu lock (bit 10); both together = cannot be unlocked locally |
 
 ## Project Status / Vibe-Coding Disclaimer
 This is a "vibe-coding" / fast-iteration community project:
@@ -252,8 +252,8 @@ Single climates that belong to a generated group are still included in the full 
 | Property | Group Logic |
 |----------|-------------|
 | Current Temperature | Average of members (or floor temp for comfort variant) |
-| Setpoint | Average of member setpoints |
-| Action | Heating if any member heating else idle |
+| Setpoint | The first member's setpoint; other members are written to match it |
+| Action | Heating if any member's controller output is on, else idle (off when all members are in standby) |
 
 ## Developer / Debug Tips
 * Start with one known-good channel powered & paired.
@@ -264,8 +264,23 @@ Single climates that belong to a generated group are still included in the full 
 ## Floor & Comfort Climates
 Comfort climates appear only for channels with a detected floor probe. Names append `Comfort` to the friendly name (or `Zone N`).
 
-## Child Lock Switches
-Each thermostat channel exposes an inferred child lock bit (observed change 0x4000 → 0x4800 in the packed configuration register; mask `0x0800`). This component surfaces that as an optional per‑channel switch.
+## Lock Switches (Child Lock / Ctrl Lock)
+The channel's packed CONFIGURATION register (category 0x02, index 0x07) carries two lock bits. The Jablotron
+"AC-116 Modbus Register Map" (section 1.6.9), which is also the register map of the Wavin AHC 9000, describes them
+as INT LOCK ("user is prevented to enter the service menu", bit 11) and CTRL LOCK ("user is prevented to make any
+changes", bit 10).
+
+On a Wavin AHC 9000 with wireless Wavin room thermostats the behaviour was verified on hardware (29-09-2026) and
+does **not** follow that wording:
+
+| `type`       | Bit | Spec name | Observed on the Wavin thermostat |
+|--------------|-----|-----------|----------------------------------|
+| `child_lock` | 11  | INT LOCK  | The thermostat's own lock (`LOc` in its menu): padlock symbol in the display, dial disabled. Locking the thermostat locally sets the bit in the controller; setting the bit from the bus locks the thermostat within a few minutes. The user can still unlock it on the thermostat (hold the knob 3 s, release, hold 3 s). |
+| `ctrl_lock`  | 10  | CTRL LOCK | Blocks the thermostat's menu. Alone it does not lock the dial. Together with `child_lock` the thermostat is locked completely: no temperature change, no menu, and it can **not** be unlocked on the thermostat any more, only from the bus. |
+
+For a room made of several channels (a thermostat learned into more than one channel) the lock only takes effect
+through the room's primary channel (the lowest channel number); the same bit set on a secondary channel alone does
+nothing.
 
 ### When to Use
 Lock the physical thermostat interface (prevent local user temperature changes) while still allowing Home Assistant / ESPHome to adjust setpoints programmatically. Turning the switch ON sets the lock; OFF clears it.
@@ -276,8 +291,14 @@ switch:
   - platform: wavinahc9000v3
     wavinahc9000v3_id: wavin
     channel: 9
-    # type: child_lock   # optional (defaults to child_lock for now)
+    type: child_lock   # default
     name: "Office Lock"
+  # Optional: menu lock. With both switches on, the thermostat can only be unlocked from Home Assistant.
+  - platform: wavinahc9000v3
+    wavinahc9000v3_id: wavin
+    channel: 9
+    type: ctrl_lock
+    name: "Office Menu Lock"
 ```
 
 Multiple channels:
@@ -298,7 +319,10 @@ switch:
 ```
 
 ### Behavior & Notes
-* Writes use a masked register update preserving unrelated bits.
+* Writes are read-modify-write of the configuration register: only the requested lock bit changes.
+* Mode changes (`climate.set_hvac_mode`) also preserve the lock bits. Earlier versions wrote a fixed baseline
+  (`0x4000 | mode`) to the whole register on every mode change, which silently cleared both locks, adaptive mode
+  and the week schedule flag.
 * The switch publishes its optimistic state immediately; an urgent refresh confirms or corrects it within the next polling cycle.
 * Safe to add/remove at any time (no reboot needed beyond normal ESPHome deployment cycle).
 * If you rarely toggle locks you can omit them from the final config to keep the entity list lean – re‑add later if needed.
@@ -336,12 +360,23 @@ automation:
 ### Troubleshooting
 | Symptom | Suggestion |
 |---------|------------|
-| Switch state flips back | Underlying write failed (bus issue); check logs at DEBUG for masked write result |
+| Switch state flips back | Underlying write failed or was rejected; check logs for `Child lock: write failed` / `controller rejected write, exception 0x..` |
 | Switch always off | Channel not yet fully discovered; wait until first packed read (discovery phase) |
 | No switch entity | YAML omitted switch platform or validation failed – ensure indentation & `platform: wavinahc9000v3` |
 
 ### Safety Considerations
 Child lock blocks manual thermostat adjustments. Ensure you have reliable automation or a fallback (e.g., override climate setpoint) before mass‑locking all zones.
+
+## Behaviour Notes
+* **Mode reporting:** only `PERMANENT STANDBY` (MODE = 1) is shown as `off`. MODE = 4 is `PARTY ON MANUAL MODE`
+  and is shown as `heat` like ECO, COMFORT and HOLIDAY.
+* **Action (`heating` / `idle`):** taken from the controller's channel output bit (OUTP ON), i.e. the actual actuator
+  state. The controller can keep the output closed while the room is below setpoint (global standby input, floor max
+  reached, high temperature cut-off) or open while it is above (floor min, frost protection when a thermostat is lost).
+* **Unknown temperatures:** the controller reports `0x7FFF` when a thermostat has not delivered a value (for example
+  after it lost radio contact). Such readings are treated as unknown instead of being published as 3276.7 °C.
+* **Rejected commands:** an exception response from the controller (function code `0xC3`/`0xC4`/`0xC5`) is logged as
+  `controller rejected ... exception 0x..` and is not retried. Only CRC errors and timeouts are retried.
 
 ## Commented Single Climates for Group Members
 When a group climate is generated, its member single-channel climates remain in the full suggestion but are commented out with an explanatory line. This keeps copy/paste flexible (just uncomment if you later decide to manage them individually).

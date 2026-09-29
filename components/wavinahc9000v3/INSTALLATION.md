@@ -118,6 +118,7 @@ switch:
     wavinahc9000v3_id: wavin
     name: "Bedroom Child Lock"
     channel: 1
+    type: child_lock
 ...
 ===================== Wavin YAML SUGGESTION END =====================
 ```
