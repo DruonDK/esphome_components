@@ -1,5 +1,6 @@
 #include "wavin_ahc9000.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"
 #include "esphome/components/sensor/sensor.h"
 #include <vector>
 #include <cmath>
@@ -411,6 +412,9 @@ bool WavinAHC9000::read_registers(uint8_t category, uint8_t page, uint8_t index,
   // final failed attempt escalates to WARN to reduce log noise from transient bus glitches.
   // An exception response from the controller is not retried: it is an answer, not a bus problem.
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
+    // Every transaction blocks the main loop for up to receive_timeout_ms; a sweep of many reads
+    // (discovery, element table) would otherwise trip the task watchdog.
+    App.feed_wdt();
     // FIX: Inter-frame delay before each transaction to allow bus turnaround
     this->inter_frame_delay_();
 
@@ -466,6 +470,7 @@ bool WavinAHC9000::read_registers(uint8_t category, uint8_t page, uint8_t index,
 bool WavinAHC9000::write_register(uint8_t category, uint8_t page, uint8_t index, uint16_t value) {
   // Same retry strategy as read_registers(); exceptions are reported and not retried.
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
+    App.feed_wdt();
     this->inter_frame_delay_();
 
     uint8_t msg[10];
@@ -522,6 +527,7 @@ bool WavinAHC9000::write_masked_register(uint8_t category, uint8_t page, uint8_t
   const uint16_t keep_mask = (uint16_t) (and_mask & ~or_mask);
   const uint16_t data = or_mask;
   for (uint8_t attempt = 0; attempt < IO_RETRY_ATTEMPTS; attempt++) {
+    App.feed_wdt();
     this->inter_frame_delay_();
 
     uint8_t msg[12];
@@ -1030,12 +1036,17 @@ void WavinAHC9000::dump_element_table() {
   ESP_LOGI(TAG, "Elements (address, assigned channels, sync channel, status):");
   uint8_t found = 0;
   for (uint8_t page = 0; page < ELEMENT_PAGES; page++) {
-    if (!this->read_registers(CAT_ELEMENTS, page, ELEM_ADDRESS_L, ELEM_REGISTER_COUNT, regs) || regs.size() < ELEM_REGISTER_COUNT) {
+    // Cheap probe first: only the two address registers. An unused page has address 0 (spec 1.3).
+    if (!this->read_registers(CAT_ELEMENTS, page, ELEM_ADDRESS_L, 2, regs) || regs.size() < 2) {
       ESP_LOGI(TAG, "  EL%02u <read failed>", (unsigned) (page + 1));
       continue;
     }
     uint32_t address = ((uint32_t) regs[1] << 16) | regs[0];
     if (address == 0) continue;  // unused page
+    if (!this->read_registers(CAT_ELEMENTS, page, ELEM_ADDRESS_L, ELEM_REGISTER_COUNT, regs) || regs.size() < ELEM_REGISTER_COUNT) {
+      ESP_LOGI(TAG, "  EL%02u addr=0x%08X <full read failed>", (unsigned) (page + 1), (unsigned) address);
+      continue;
+    }
     found++;
     uint32_t map = ((uint32_t) regs[ELEM_ASSIGNMENT_MAP_H] << 16) | regs[ELEM_ASSIGNMENT_MAP_L];
     std::string channels;
