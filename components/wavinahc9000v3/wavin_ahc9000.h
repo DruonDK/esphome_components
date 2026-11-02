@@ -101,6 +101,10 @@ class WavinAHC9000 : public PollingComponent, public uart::UARTDevice {
   void request_status_channel(uint8_t ch_index);
   void normalize_channel_config(uint8_t channel, bool off);
   void generate_yaml_suggestion();
+  // Log the controller's element table: every learned element (thermostat etc.) with its address,
+  // the channels it is assigned to, its sync (primary) channel and status. Shows which thermostat
+  // actually drives which channel, which the per-channel registers alone do not reveal.
+  void dump_element_table();
   // Debug helper to dump registers for a channel (to identify floor min/max addresses)
   void dump_channel_floor_limits(uint8_t channel);
   bool is_channel_locked(uint8_t ch, LockKind kind) const;
@@ -228,6 +232,19 @@ class WavinAHC9000 : public PollingComponent, public uart::UARTDevice {
   static constexpr uint8_t ELEM_AIR_TEMPERATURE = 0x04; // index within block
   static constexpr uint8_t ELEM_FLOOR_TEMPERATURE = 0x05; // index for floor probe
   static constexpr uint8_t ELEM_BATTERY_STATUS = 0x0A;
+  // Element registers used by dump_element_table() (spec 1.3.1)
+  static constexpr uint8_t ELEM_ADDRESS_L = 0x00;
+  static constexpr uint8_t ELEM_ASSIGNMENT_MAP_L = 0x02;
+  static constexpr uint8_t ELEM_ASSIGNMENT_MAP_H = 0x03;
+  static constexpr uint8_t ELEM_STATUS = 0x08;
+  static constexpr uint8_t ELEM_SYNC_GROUP = 0x0B;
+  static constexpr uint8_t ELEM_REGISTER_COUNT = 13;
+  static constexpr uint8_t ELEMENT_PAGES = 48;
+  static constexpr uint16_t ELEM_STATUS_ALIVE_MASK = 0x8000;
+  static constexpr uint16_t ELEM_STATUS_LOST_MASK = 0x0800;
+  static constexpr uint16_t ELEM_STATUS_LOW_BATT_MASK = 0x0400;
+  static constexpr uint16_t ELEM_STATUS_TP_MASK = 0x0100;
+  static constexpr uint16_t ELEM_STATUS_TP_ACT_MASK = 0x0080;
   static constexpr uint16_t TEMP_UNKNOWN_RAW = 0x7FFF;  // "temperature not known" marker (spec 1.3.6)
 
   static constexpr uint8_t PACKED_MANUAL_TEMPERATURE = 0x00;
@@ -345,6 +362,10 @@ class WavinZoneClimate : public climate::Climate, public Component {
     this->members_.clear();
   }
   void set_use_floor_temperature(bool v) { this->use_floor_temperature_ = v; }
+  // Opt-in: write the first member's setpoint to the other members whenever they differ.
+  // Off by default: the controller already keeps the channels of a room in sync, and with this on the
+  // hub overwrites any setpoint change made on a thermostat within seconds.
+  void set_sync_members(bool v) { this->sync_members_ = v; }
   void set_members(const std::vector<int> &members) {
     this->members_.clear();
     for (int m : members) this->members_.push_back(static_cast<uint8_t>(m));
@@ -364,6 +385,7 @@ class WavinZoneClimate : public climate::Climate, public Component {
   bool single_channel_set_{false};
   std::vector<uint8_t> members_{};
   bool use_floor_temperature_{false};
+  bool sync_members_{false};
 };
 
 }  // namespace wavinahc9000v3

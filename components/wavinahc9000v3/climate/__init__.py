@@ -13,6 +13,7 @@ CONF_MEMBERS = "members"
 CONF_STRICT_MODE_WRITES = "strict_mode_writes"
 
 CONF_USE_FLOOR_TEMPERATURE = "use_floor_temperature"
+CONF_SYNC_MEMBERS = "sync_members"
 
 CONFIG_SCHEMA = climate.climate_schema(WavinZoneClimate).extend(
     {
@@ -21,6 +22,9 @@ CONFIG_SCHEMA = climate.climate_schema(WavinZoneClimate).extend(
         cv.Optional(CONF_MEMBERS): cv.ensure_list(cv.int_range(min=1, max=16)),
         cv.Optional(CONF_STRICT_MODE_WRITES, default=False): cv.boolean,
         cv.Optional(CONF_USE_FLOOR_TEMPERATURE, default=False): cv.boolean,
+        # Group climates only: write the first member's setpoint to members that differ. Off by default,
+        # the controller keeps a room's channels in sync itself and this would undo thermostat changes.
+        cv.Optional(CONF_SYNC_MEMBERS, default=False): cv.boolean,
     }
 )
 
@@ -41,6 +45,8 @@ async def to_code(config):
         cg.add(hub.add_channel_climate(var))
     if CONF_MEMBERS in config:
         cg.add(var.set_members(config[CONF_MEMBERS]))
+        if config[CONF_SYNC_MEMBERS]:
+            cg.add(var.set_sync_members(True))
         for ch in config[CONF_MEMBERS]:
             cg.add(hub.add_active_channel(ch))
         cg.add(hub.add_group_climate(var))

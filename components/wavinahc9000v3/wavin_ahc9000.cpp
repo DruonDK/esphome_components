@@ -434,6 +434,12 @@ bool WavinAHC9000::read_registers(uint8_t category, uint8_t page, uint8_t index,
     std::vector<uint8_t> buf;
     uint8_t exc = 0;
     RxResult r = this->receive_frame_(FC_READ, buf, exc);
+    if (r == RxResult::OK && buf[2] != (uint8_t) (2 * count)) {
+      // A well-formed frame, but not the answer to this request (e.g. a late reply to an earlier
+      // read of a different size). Treat it like a corrupted frame and retry.
+      ESP_LOGD(TAG, "RX: byte count %u does not match request (%u) -> retry", (unsigned) buf[2], (unsigned) (2 * count));
+      r = RxResult::CRC_ERROR;
+    }
     if (r == RxResult::OK) {
       uint8_t bytes = buf[2];
       out.clear();
@@ -485,8 +491,14 @@ bool WavinAHC9000::write_register(uint8_t category, uint8_t page, uint8_t index,
     uint8_t exc = 0;
     RxResult r = this->receive_frame_(FC_WRITE, buf, exc);
     if (r == RxResult::OK) {
-      ESP_LOGD(TAG, "ACK-WR: OK");
-      return true;
+      // The response echoes the written data (spec 4.3); anything else is not the ack for this write.
+      uint16_t echoed = (buf[2] >= 2) ? (uint16_t) ((buf[3] << 8) | buf[4]) : 0xFFFF;
+      if (buf[2] == 2 && echoed == value) {
+        ESP_LOGD(TAG, "ACK-WR: OK");
+        return true;
+      }
+      ESP_LOGD(TAG, "ACK-WR: echo 0x%04X (len %u) does not match 0x%04X -> retry", (unsigned) echoed, (unsigned) buf[2], (unsigned) value);
+      r = RxResult::CRC_ERROR;
     }
     if (r == RxResult::EXCEPTION) {
       ESP_LOGW(TAG, "ACK-WR: controller rejected write, exception 0x%02X (cat=%u idx=%u page=%u val=0x%04X)", exc, category, index, page, (unsigned) value);
@@ -996,6 +1008,60 @@ void WavinAHC9000::generate_yaml_suggestion() {
     }
   }
   ESP_LOGI(TAG, "===================== Wavin YAML SUGGESTION END =====================");
+  this->dump_element_table();
+}
+
+void WavinAHC9000::dump_element_table() {
+  // Elements category (spec 1.3): one page per learned element. ADDRESS == 0 means the page is unused.
+  // ASSIGNMENT MAP: bit n (0-based) set => element is learned into channel n+1 (CH0 AF = channel 1).
+  // SYNC GROUP: the element's primary channel number, 0-based.
+  std::vector<uint16_t> regs;
+  ESP_LOGI(TAG, "==================== Wavin ELEMENT TABLE BEGIN ====================");
+  ESP_LOGI(TAG, "Channel -> primary element (PRIMELEM, 1-based; 0 = channel unused):");
+  for (uint8_t ch = 1; ch <= 16; ch++) {
+    if (this->read_registers(CAT_CHANNELS, (uint8_t) (ch - 1), CH_PRIMARY_ELEMENT, 1, regs) && regs.size() >= 1) {
+      uint16_t v = regs[0];
+      ESP_LOGI(TAG, "  CH%02u primary=EL%02u%s", (unsigned) ch, (unsigned) (v & CH_PRIMARY_ELEMENT_ELEMENT_MASK),
+               (v & CH_PRIMARY_ELEMENT_ALL_TP_LOST_MASK) ? " (all thermostats lost)" : "");
+    } else {
+      ESP_LOGI(TAG, "  CH%02u <read failed>", (unsigned) ch);
+    }
+  }
+  ESP_LOGI(TAG, "Elements (address, assigned channels, sync channel, status):");
+  uint8_t found = 0;
+  for (uint8_t page = 0; page < ELEMENT_PAGES; page++) {
+    if (!this->read_registers(CAT_ELEMENTS, page, ELEM_ADDRESS_L, ELEM_REGISTER_COUNT, regs) || regs.size() < ELEM_REGISTER_COUNT) {
+      ESP_LOGI(TAG, "  EL%02u <read failed>", (unsigned) (page + 1));
+      continue;
+    }
+    uint32_t address = ((uint32_t) regs[1] << 16) | regs[0];
+    if (address == 0) continue;  // unused page
+    found++;
+    uint32_t map = ((uint32_t) regs[ELEM_ASSIGNMENT_MAP_H] << 16) | regs[ELEM_ASSIGNMENT_MAP_L];
+    std::string channels;
+    for (uint8_t bit = 0; bit < 17; bit++) {
+      if (map & (1UL << bit)) {
+        if (!channels.empty()) channels += ",";
+        channels += std::to_string((int) bit + 1);
+      }
+    }
+    if (channels.empty()) channels = "-";
+    uint16_t status = regs[ELEM_STATUS];
+    uint8_t sync = (uint8_t) (regs[ELEM_SYNC_GROUP] & 0xFF);
+    uint16_t batt = regs[ELEM_BATTERY_STATUS] & 0x0F;
+    float air = this->raw_temp_to_c_(regs[ELEM_AIR_TEMPERATURE]);
+    ESP_LOGI(TAG, "  EL%02u addr=0x%08X channels=[%s] sync_ch=%u %s%s%s%s batt=%u0%% air=%.1fC",
+             (unsigned) (page + 1), (unsigned) address, channels.c_str(), (unsigned) (sync + 1),
+             (status & ELEM_STATUS_TP_MASK) ? "thermostat" : "other",
+             (status & ELEM_STATUS_ALIVE_MASK) ? " alive" : " NOT-ALIVE",
+             (status & ELEM_STATUS_LOST_MASK) ? " LOST" : "",
+             (status & ELEM_STATUS_LOW_BATT_MASK) ? " LOW-BATT" : "",
+             (unsigned) batt, air);
+  }
+  ESP_LOGI(TAG, "%u element(s) found. A thermostat listed under more than one channel receives the packed",
+           (unsigned) found);
+  ESP_LOGI(TAG, "data (setpoint, mode, locks) of all of them; its sync channel is the one it reports back to.");
+  ESP_LOGI(TAG, "===================== Wavin ELEMENT TABLE END =====================");
 }
 
 void WavinAHC9000::publish_updates() {
@@ -1293,8 +1359,9 @@ void WavinZoneClimate::update_from_parent() {
         sum_curr += c;
         n_curr++;
       }
-      // Auto-sync: if a secondary member has a different setpoint, write the primary's value to it
-      if (ch != primary_ch && !std::isnan(primary_setpoint)) {
+      // Optional auto-sync (sync_members: true): write the primary's setpoint to a member that differs.
+      // Off by default; see set_sync_members().
+      if (this->sync_members_ && ch != primary_ch && !std::isnan(primary_setpoint)) {
         float s = this->parent_->get_channel_setpoint(ch);
         if (!std::isnan(s) && std::fabs(s - primary_setpoint) > 0.049f) {
           ESP_LOGI(TAG, "Group sync: CH%u setpoint %.1fC -> %.1fC (primary CH%u)",

@@ -252,8 +252,26 @@ Single climates that belong to a generated group are still included in the full 
 | Property | Group Logic |
 |----------|-------------|
 | Current Temperature | Average of members (or floor temp for comfort variant) |
-| Setpoint | The first member's setpoint; other members are written to match it |
+| Setpoint | The first member's setpoint. With `sync_members: true` the other members are written to match it (off by default: the controller keeps a room's channels in sync itself, and the hub would otherwise undo any setpoint change made on the thermostat within seconds) |
 | Action | Heating if any member's controller output is on, else idle (off when all members are in standby) |
+
+## Element Table (which thermostat drives which channel)
+`generate_yaml_suggestion()` (the `dump_wavin_yaml` service / "Dump Wavin YAML" button) now also logs the
+controller's element table: every learned element with its address, the channels it is assigned to, its sync
+channel, status and battery. A thermostat that is learned into more than one channel receives the packed data
+(setpoint, mode, locks) of all of those channels and reports its own changes back to its sync channel. If a
+room heats to a setpoint that is not the one shown for its channel, look here first.
+
+```
+==================== Wavin ELEMENT TABLE BEGIN ====================
+Channel -> primary element (PRIMELEM, 1-based; 0 = channel unused):
+  CH01 primary=EL01
+  ...
+Elements (address, assigned channels, sync channel, status):
+  EL01 addr=0x0012ABCD channels=[1] sync_ch=1 thermostat alive batt=90% air=22.4C
+  EL03 addr=0x0012ABEF channels=[3,8] sync_ch=3 thermostat alive batt=30% air=24.1C
+===================== Wavin ELEMENT TABLE END =====================
+```
 
 ## Developer / Debug Tips
 * Start with one known-good channel powered & paired.
